@@ -9,10 +9,14 @@ import android.content.res.Configuration
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Bundle
+import android.os.VibrationEffect
+import android.os.Vibrator
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
@@ -26,7 +30,9 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -200,8 +206,38 @@ fun CameraControlScreen(
     cam: PtpCamera?,
     modifier: Modifier = Modifier,
     onOpenGallery: () -> Unit = {},
-    onOpenFeatures: () -> Unit = {}
+    onOpenFeatures: () -> Unit = {},
+    /** Hook: called (on a background thread) for every PTP event from the camera. */
+    onCameraEvent: (PtpEvent) -> Unit = {}
 ) {
+    // Small feedback whenever the camera reports a shot, however it was triggered
+    val shotFlash = remember { Animatable(0f) }
+    val currentOnCameraEvent by rememberUpdatedState(onCameraEvent)
+    var shotCount by remember { mutableIntStateOf(0) }
+    val context = LocalContext.current
+    val vibrator = remember { context.getSystemService(Vibrator::class.java) }
+    var lastFlash = 0L
+    DisposableEffect(cam) {
+        val sub = cam?.addEventListener { ev ->
+            currentOnCameraEvent(ev)
+            if (ev.code in PtpEvent.SHUTTER_FIRED) {
+                // one shot can send several of these events; flash only on the first
+                val now = System.currentTimeMillis()
+                if (now - lastFlash > 400) {
+                    lastFlash = now
+                    shotCount++
+                    vibrator?.vibrate(VibrationEffect.createOneShot(40, VibrationEffect.DEFAULT_AMPLITUDE))
+                }
+            }
+        }
+        onDispose { sub?.close() }
+    }
+    LaunchedEffect(shotCount) {
+        if (shotCount == 0) return@LaunchedEffect
+        shotFlash.snapTo(1f)
+        shotFlash.animateTo(0f, tween(250))
+    }
+
     var battery by remember { mutableStateOf("---") }
 
     var apertureState by remember { mutableStateOf(CameraParam()) }
@@ -306,7 +342,14 @@ fun CameraControlScreen(
     val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
 
     val lcd: @Composable () -> Unit = {
-        LcdPanel(battery, apertureState, shutterState, isoState, evState)
+        Box {
+            LcdPanel(battery, apertureState, shutterState, isoState, evState)
+            Box(
+                Modifier.matchParentSize()
+                    .graphicsLayer { alpha = shotFlash.value }
+                    .background(Color.White, RoundedCornerShape(4.dp))
+            )
+        }
     }
     val sliders: @Composable (Modifier) -> Unit = { m ->
         Column(

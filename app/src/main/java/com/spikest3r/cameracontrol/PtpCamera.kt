@@ -4,11 +4,27 @@ import android.hardware.usb.*
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 private val LE = ByteOrder.LITTLE_ENDIAN
 
 class PtpResponse(val code: Int, val data: ByteArray) { val ok get() = code == 0x2001 }
 class PtpException(val code: Int, msg: String) : Exception(msg)
+class PtpEvent(val code: Int, val params: IntArray) {
+    companion object {
+        const val OBJECT_ADDED = 0x4002
+        const val CAPTURE_COMPLETE = 0x400D
+        /** Events that mean "a picture was taken" (physical shutter, our button, any other PTP trigger). */
+        val SHOT = setOf(OBJECT_ADDED, CAPTURE_COMPLETE)
+        /** Nikon ObjectAddedInSDRAM: sent as soon as the exposure is done, before the file is written. */
+        const val NIKON_OBJECT_ADDED_IN_SDRAM = 0xC101
+        /** Earliest signals we get that the shutter fired, for instant UI feedback. */
+        val SHUTTER_FIRED = setOf(NIKON_OBJECT_ADDED_IN_SDRAM, OBJECT_ADDED, CAPTURE_COMPLETE)
+    }
+}
+
 class PropDesc(val type: Int, val rw: Boolean, val cur: Long, val allowed: List<Long>)
 
 class PtpCamera private constructor(
@@ -20,6 +36,9 @@ class PtpCamera private constructor(
 ) : AutoCloseable {
 
     private var tid = 0
+    private val listeners = CopyOnWriteArrayList<(PtpEvent) -> Unit>()
+    @Volatile private var pumping = false
+    private var pump: Thread? = null
 
     companion object {
         fun open(usb: UsbManager, dev: UsbDevice): PtpCamera {
@@ -36,7 +55,7 @@ class PtpCamera private constructor(
                     ep.type == UsbConstants.USB_ENDPOINT_XFER_INT -> e = ep
                 }
             }
-            return PtpCamera(conn, intf, o!!, i!!, e).also { it.cmd(0x1002, 1) }
+            return PtpCamera(conn, intf, o!!, i!!, e).also { it.cmd(0x1002, 1); it.startEventPump() }
         }
     }
 
@@ -92,27 +111,32 @@ class PtpCamera private constructor(
         throw PtpException(0x2019, "busy timeout")
     }
 
-    fun drainEvents() {
-        val e = evt ?: return
-        val b = ByteArray(64)
-        while (conn.bulkTransfer(e, b, b.size, 20) > 0) { }
+    /**
+     * Subscribes to every PTP event the camera sends (called on the event thread, keep it quick).
+     * Returns a handle; call close() on it to unsubscribe.
+     */
+    fun addEventListener(l: (PtpEvent) -> Unit): AutoCloseable {
+        listeners.add(l)
+        return AutoCloseable { listeners.remove(l) }
     }
 
-    /** Waits for one of [codes] on the interrupt endpoint. Null on timeout / no endpoint. */
-    fun waitEvent(codes: Set<Int>, timeoutMs: Long = 10_000): Int? {
-        val e = evt ?: return null
-        val end = System.currentTimeMillis() + timeoutMs
-        val b = ByteArray(64)
-        while (System.currentTimeMillis() < end) {
-            val n = conn.bulkTransfer(e, b, b.size, 300)
-            if (n >= 12) {
-                val bb = ByteBuffer.wrap(b).order(LE)
-                val type = bb.getShort(4).toInt() and 0xFFFF
+    /** Single reader of the interrupt endpoint; everything else goes through [addEventListener]. */
+    private fun startEventPump() {
+        val e = evt ?: return
+        pumping = true
+        pump = Thread {
+            val b = ByteArray(64)
+            while (pumping) {
+                val n = conn.bulkTransfer(e, b, b.size, 300)
+                if (n < 12) continue
+                val bb = ByteBuffer.wrap(b, 0, n).order(LE)
+                if ((bb.getShort(4).toInt() and 0xFFFF) != 4) continue
                 val code = bb.getShort(6).toInt() and 0xFFFF
-                if (type == 4 && code in codes) return code
+                val params = IntArray(minOf(3, (n - 12) / 4)) { bb.getInt(12 + it * 4) }
+                val ev = PtpEvent(code, params)
+                listeners.forEach { l -> runCatching { l(ev) } }
             }
-        }
-        return null
+        }.apply { isDaemon = true; name = "ptp-events"; start() }
     }
 
     private fun sizeOf(t: Int) = when (t) { 1, 2 -> 1; 3, 4 -> 2; 5, 6 -> 4; else -> error("type $t") }
@@ -152,13 +176,18 @@ class PtpCamera private constructor(
 
     /** Capture, then wait for CaptureComplete/ObjectAdded (falls back to a sleep if no event arrives). */
     fun shoot() {
-        drainEvents()
-        cmd(0x100E, 0, 0)
-        if (waitEvent(setOf(0x400D, 0x4002)) == null) Thread.sleep(1500)
+        val done = CountDownLatch(1)
+        val sub = addEventListener { if (it.code in PtpEvent.SHOT) done.countDown() }
+        try {
+            cmd(0x100E, 0, 0)
+            if (!done.await(10, TimeUnit.SECONDS)) Thread.sleep(1500)
+        } finally { sub.close() }
     }
     fun afDrive() { cmd(0x90C1) }
 
     override fun close() {
+        pumping = false
+        runCatching { pump?.join(500) }
         runCatching { transact(0x1003) }
         conn.releaseInterface(intf)
         conn.close()
