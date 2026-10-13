@@ -46,7 +46,7 @@ fun FeaturesScreen(cam: PtpCamera, modifier: Modifier = Modifier, onClose: () ->
         ) {
             FeatureCard(
                 title = "HDR Bracketing (3 Shots)",
-                description = "Captures 3 sequential exposures (-2EV, 0EV, +2EV)." // TODO: redo this
+                description = "Captures 3 sequential exposures (-2EV, 0EV, +2EV)."
             ) {
                 onClose()
 
@@ -65,6 +65,35 @@ fun FeaturesScreen(cam: PtpCamera, modifier: Modifier = Modifier, onClose: () ->
                         shoot()
 
                         setProp(0x5010, 0)
+                    }
+                }
+            }
+
+            FeatureCard(
+                title = "Astrophotography",
+                description = "Prepares camera settings for photography (use MANUAL mode on camera)"
+            ) {
+                onClose()
+
+                thread {
+                    cam.apply {
+                        setProp(0x500F, 1600) // ISO 1600 (i use this personally, although 3200 is also nice)
+
+                        setProp(0x5010, 0) // EV 0
+
+                        // get widest aperture
+                        val ap = getDesc(0x5007)
+                        if (ap.rw && ap.allowed.isNotEmpty()) {
+                            setProp(0x5007, ap.allowed.min()) // set
+                        }
+
+                        // set closest value that doesnt exceed 30"
+                        // bulb is skipped!
+                        val sh = getDesc(0x500D)
+                        if (sh.rw && sh.allowed.isNotEmpty()) {
+                            val target = sh.allowed.filter { it <= 300_000L }.maxOrNull()
+                            if (target != null) setProp(0x500D, target)
+                        }
                     }
                 }
             }
